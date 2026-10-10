@@ -1,0 +1,17 @@
+{
+  "name": "subagent-usage",
+  "version": "0.2.0",
+  "description": "Records token usage, active time and git line counts per subagent, and renders static HTML pages with per-role trend charts",
+  "author": {
+    "name": "jecikpo"
+  },
+  "license": "MIT",
+  "keywords": ["subagents", "tokens", "usage", "metrics", "hooks"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Subagent usage",
+    "shortDescription": "Token, time and code-line metrics per subagent, as static HTML pages",
+    "developerName": "jecikpo",
+    "category": "Developer Tools"
+  }
+}

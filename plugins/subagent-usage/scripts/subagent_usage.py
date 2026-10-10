@@ -36,15 +36,16 @@ from collections import defaultdict
 from datetime import datetime, timezone
 
 CLAUDE_DIR = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+CODEX_DIR = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
 CSV_PATH = os.environ.get("SUBAGENT_USAGE_CSV") or os.path.join(CLAUDE_DIR, "subagent-usage.csv")
 OUT_DIR = os.environ.get("SUBAGENT_USAGE_DIR") or os.path.join(CLAUDE_DIR, "subagent-usage")
 SESSIONS_DIR = os.path.join(OUT_DIR, "sessions")
 FIELDS = [
-    "logged_at", "started_at", "project", "project_dir", "session_id", "agent_id",
+    "logged_at", "started_at", "tool", "project", "project_dir", "session_id", "agent_id",
     "agent_type", "model", "description", "wall_s", "api_calls", "tool_calls", "input_tokens",
     "cache_read_tokens", "cache_creation_tokens", "total_input_tokens",
     "peak_context", "longest_turn_s", "api_errors", "idle_gaps", "commits",
-    "lines_added", "lines_deleted", "code_added", "code_deleted", "transcript",
+    "lines_added", "lines_deleted", "code_added", "code_deleted", "output_tokens", "transcript",
 ]
 
 
@@ -230,7 +231,23 @@ def git_stats(repo, segments):
     return out
 
 
+def is_codex(path):
+    """Codex rollout files start with a session_meta record; Claude Code files never do."""
+    try:
+        with open(path) as f:
+            for line in f:
+                if line.strip():
+                    return json.loads(line).get("type") == "session_meta"
+    except (OSError, ValueError):
+        pass
+    return False
+
+
 def analyze(path):
+    return analyze_codex(path) if is_codex(path) else analyze_claude(path)
+
+
+def analyze_claude(path):
     reqs = {}
     tool_calls = api_errors = idle_gaps = 0
     active = 0.0
@@ -301,8 +318,133 @@ def analyze(path):
         "longest_turn_s": round(longest),
         "api_errors": api_errors,
         "project_dir": repo or "",
-        **(git_stats(repo, segments + ([(seg_start.timestamp(), last.timestamp())] if last else []))
-           if rules_for(repo)["settings"]["git_stats"] else dict.fromkeys(GIT_FIELDS, "")),
+        "tool": "claude",
+        "output_tokens": "",
+        **git_fields(repo, segments + ([(seg_start.timestamp(), last.timestamp())] if last else [])),
+    }
+
+
+def git_fields(repo, segments):
+    if rules_for(repo)["settings"]["git_stats"]:
+        return git_stats(repo, segments)
+    return dict.fromkeys(GIT_FIELDS, "")
+
+
+# Codex rollout files (~/.codex/sessions/**/rollout-*.jsonl). Each line is
+# {"timestamp", "type", "payload"}; types: session_meta, turn_context, response_item, event_msg.
+# A subagent's session_meta has source.subagent.thread_spawn {parent_thread_id, depth,
+# agent_path, agent_nickname, agent_role}. Token counts are event_msg/token_count records with
+# running totals (info.total_token_usage); input_tokens includes cached_input_tokens.
+#
+# A forked subagent file starts with the parent's history, written with the creation time,
+# and its first total already includes the parent's usage. Records up to CODEX_REPLAY_S after
+# session_meta are taken as that copy: the agent's own tokens are the last total minus the
+# last total in that window. NOT VERIFIED against real files yet (built from the Codex source
+# and bug reports of other usage tools).
+CODEX_REPLAY_S = 1.0
+CODEX_TOOL_ITEMS = {"function_call", "custom_tool_call", "local_shell_call", "web_search_call"}
+CODEX_USAGE_KEYS = ("input_tokens", "cached_input_tokens", "cache_write_input_tokens",
+                    "output_tokens", "total_tokens")
+
+
+def read_codex(path):
+    recs = []
+    with open(path) as f:
+        for line in f:
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(r, dict) and r.get("timestamp"):
+                recs.append((ts(r["timestamp"]), r.get("type"), r.get("payload") or {}))
+    return recs
+
+
+def codex_spawn(meta):
+    src = meta.get("source")
+    if isinstance(src, dict):
+        sub = src.get("subagent")
+        if isinstance(sub, dict) and isinstance(sub.get("thread_spawn"), dict):
+            return sub["thread_spawn"]
+    return {}
+
+
+def analyze_codex(path):
+    recs = read_codex(path)
+    meta = next((p for _, k, p in recs if k == "session_meta"), {})
+    start = next((t for t, k, _ in recs if k == "session_meta"), recs[0][0] if recs else None)
+    cut = start.timestamp() + CODEX_REPLAY_S if start else 0
+    base = dict.fromkeys(CODEX_USAGE_KEYS, 0)
+    final = dict(base)
+    seen_totals = set()
+    api_calls = tool_calls = api_errors = idle_gaps = 0
+    peak = 0
+    active = longest = 0.0
+    last = seg_start = None
+    segments = []
+    model = None
+    task = ""
+    for t, kind, p in recs:
+        own = t.timestamp() > cut
+        if kind == "turn_context" and p.get("model"):
+            model = p["model"]
+        if kind == "event_msg" and p.get("type") == "user_message" and (not own or not task):
+            task = str(p.get("message") or "")
+        if kind == "event_msg" and p.get("type") == "token_count" and p.get("info"):
+            total = {k: (p["info"].get("total_token_usage") or {}).get(k, 0) or 0 for k in CODEX_USAGE_KEYS}
+            if not own:
+                base = total
+            elif total["total_tokens"] not in seen_totals:  # rollouts can repeat a record
+                api_calls += 1
+                lu = p["info"].get("last_token_usage") or {}
+                peak = max(peak, (lu.get("input_tokens") or 0) + (lu.get("cache_write_input_tokens") or 0))
+            seen_totals.add(total["total_tokens"])
+            final = total
+        if not own:
+            continue
+        if kind == "response_item" and p.get("type") in CODEX_TOOL_ITEMS:
+            tool_calls += 1
+        if kind == "event_msg" and p.get("type") in ("error", "stream_error"):
+            api_errors += 1
+        if last is None:
+            last = seg_start = start or t
+        gap = (t - last).total_seconds()
+        if gap > IDLE_GAP_S:
+            idle_gaps += 1
+            segments.append((seg_start.timestamp(), last.timestamp()))
+            seg_start = t
+        elif gap > 0:
+            active += gap
+            longest = max(longest, gap)
+        last = t
+    use = {k: max(final[k] - base[k], 0) for k in CODEX_USAGE_KEYS}
+    cached, write = use["cached_input_tokens"], use["cache_write_input_tokens"]
+    spawn = codex_spawn(meta)
+    repo = meta.get("cwd")
+    if last is not None:
+        segments.append((seg_start.timestamp(), last.timestamp()))
+    first_line = next((l.strip() for l in task.splitlines() if l.strip()), "")
+    return {
+        "started_at": start.isoformat(timespec="seconds") if start else "",
+        "model": model or "",
+        "wall_s": round(active),
+        "idle_gaps": idle_gaps,
+        "api_calls": api_calls,
+        "tool_calls": tool_calls,
+        "input_tokens": max(use["input_tokens"] - cached - write, 0),
+        "cache_read_tokens": cached,
+        "cache_creation_tokens": write,
+        "total_input_tokens": use["input_tokens"],
+        "peak_context": peak,
+        "longest_turn_s": round(longest),
+        "api_errors": api_errors,
+        "project_dir": repo or "",
+        "tool": "codex",
+        "output_tokens": use["output_tokens"],
+        "_agent_id": meta.get("id", ""),
+        "_agent_type": spawn.get("agent_role") or spawn.get("agent_type") or "",
+        "_description": spawn.get("agent_path") or spawn.get("agent_nickname") or first_line[:120],
+        **git_fields(repo, segments),
     }
 
 
@@ -314,22 +456,25 @@ def add_row(hook):
         path = os.path.join(base, "subagents", f"agent-{agent_id}.jsonl")
     if not path or not os.path.exists(path):
         return False
-    if not agent_id:
-        agent_id = os.path.basename(path)[len("agent-"):-len(".jsonl")]
     meta = {}
     meta_path = path[: -len(".jsonl")] + ".meta.json"
     if os.path.exists(meta_path):
         with open(meta_path) as f:
             meta = json.load(f)
     row = analyze(path)
+    agent_id = agent_id or row.pop("_agent_id", "") or os.path.basename(path)[len("agent-"):-len(".jsonl")]
+    agent_type = hook.get("agent_type") or meta.get("agentType") or row.get("_agent_type", "")
+    description = meta.get("description") or row.get("_description", "")
+    for k in ("_agent_id", "_agent_type", "_description"):
+        row.pop(k, None)
     row.update({
         "logged_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "project": os.path.basename(hook.get("cwd") or row.get("project_dir") or ""),
         "project_dir": hook.get("cwd") or row.get("project_dir") or "",
         "session_id": hook.get("session_id", ""),
         "agent_id": agent_id,
-        "agent_type": hook.get("agent_type") or meta.get("agentType", ""),
-        "description": meta.get("description", ""),
+        "agent_type": agent_type,
+        "description": description,
         "transcript": path,
     })
     upsert_row(row)
@@ -357,8 +502,36 @@ def upsert_row(row):
         os.replace(tmp, CSV_PATH)
 
 
+def codex_children(root_id):
+    """Rollout files of all subagents below one Codex session (any depth)."""
+    parent_of = {}
+    for path in glob.glob(os.path.join(CODEX_DIR, "sessions", "**", "rollout-*.jsonl"), recursive=True):
+        try:
+            with open(path) as f:
+                r = json.loads(f.readline())
+        except (OSError, ValueError):
+            continue
+        p = r.get("payload") or {}
+        if r.get("type") == "session_meta" and codex_spawn(p).get("parent_thread_id"):
+            parent_of[path] = (p.get("id"), codex_spawn(p)["parent_thread_id"])
+    ids, found, grew = {root_id}, [], True
+    while grew:
+        grew = False
+        for path, (tid, parent) in list(parent_of.items()):
+            if parent in ids:
+                ids.add(tid)
+                found.append(path)
+                del parent_of[path]
+                grew = True
+    return sorted(found)
+
+
 def find_session(arg):
     """(session_id, [agent transcript paths]) for a session id or a session .jsonl path."""
+    if arg.endswith(".jsonl") and is_codex(arg):
+        with open(arg) as f:
+            sid = (json.loads(f.readline()).get("payload") or {}).get("id", "")
+        return sid, codex_children(sid)
     if arg.endswith(".jsonl"):
         sid = os.path.basename(arg)[: -len(".jsonl")]
         dirs = [os.path.join(os.path.dirname(os.path.abspath(arg)), sid, "subagents")]
@@ -366,7 +539,7 @@ def find_session(arg):
         sid = arg
         dirs = glob.glob(os.path.join(CLAUDE_DIR, "projects", "*", glob.escape(sid), "subagents"))
     paths = sorted(p for d in dirs for p in glob.glob(os.path.join(d, "agent-*.jsonl")))
-    return sid, paths
+    return sid, paths or codex_children(sid)
 
 
 def session_cwd(agent_path):
@@ -374,6 +547,8 @@ def session_cwd(agent_path):
 
     An agent transcript can start in a subfolder, so its own cwd is only the fallback.
     """
+    if "/subagents/" not in agent_path:
+        return None  # Codex: the rollout's own session_meta cwd is used
     main = os.path.dirname(os.path.dirname(agent_path)) + ".jsonl"
     try:
         with open(main) as f:
@@ -719,10 +894,12 @@ COLS = [  # (header, field, numeric, formatter)
     ("Code +", "code_added", True, lambda v: fmt_n(num(v))),
     ("Code -", "code_deleted", True, lambda v: fmt_n(num(v))),
     ("Commits", "commits", False, str),
+    ("Output", "output_tokens", True, lambda v: fmt_n(num(v)) if v not in ("", None) else ""),
 ]
 
-NOTE = ("<p class='note'>Total input = input + cache read + cache write tokens. Output tokens are "
-        "not shown: the transcripts do not record them correctly. Token counts are not costs; "
+NOTE = ("<p class='note'>Total input = input + cache read + cache write tokens. Output tokens: "
+        "Claude Code transcripts do not record them correctly, so only Codex agents have them "
+        "(Output column). For Codex, the cached input is part of the total input. Token counts are not costs; "
         "cache reads have a lower price per token. Wall time is active time: gaps over 30 min "
         "between transcript records (an agent resumed later) count as idle gaps, not work. "
         "Wall times in the summaries are sums, so parallel agents count separately. "
@@ -812,7 +989,8 @@ def render_session(session_id, rows):
     starts = sorted(r["started_at"] for r in rows if r.get("started_at"))
     span = f"{starts[0][:16].replace('T', ' ')} to {starts[-1][:16].replace('T', ' ')} UTC" if starts else ""
     body = [f"<p class='crumb'><a href='../index.html'>&larr; All sessions</a></p>",
-            f"<h1>{esc(title)}</h1><p class='meta'>Project {esc(first.get('project', ''))} &middot; "
+            f"<h1>{esc(title)}</h1><p class='meta'>{esc(tool_name(first))} &middot; "
+            f"project {esc(first.get('project', ''))} &middot; "
             f"session {esc(session_id)} &middot; {len(rows)} subagents &middot; {esc(span)}. "
             f"Generated {generated()} UTC.</p>", NOTE, summaries(rows, "This session")]
 
@@ -851,7 +1029,9 @@ def render_session(session_id, rows):
     body.append("<h2>Agents</h2><p class='meta'>Click a column header to sort. The filter above "
                 "also applies to this table.</p>")
     git_on = rules_for(first.get("project_dir"))["settings"]["git_stats"]
-    cols = [c for c in COLS if git_on or c[1] not in GIT_FIELDS]
+    has_output = any(r.get("output_tokens") not in ("", None) for r in rows)
+    cols = [c for c in COLS if (git_on or c[1] not in GIT_FIELDS)
+            and (has_output or c[1] != "output_tokens")]
     head = "".join(f"<th class='{'num' if n else ''}'>{h}</th>" for h, _, n, _ in cols)
     trs = []
     for r in rows:
@@ -868,6 +1048,10 @@ def render_session(session_id, rows):
     body.append(f"<div class='wrap'><table id='agents' class='sortable'><thead><tr>{head}</tr></thead>"
                 f"<tbody>{''.join(trs)}</tbody></table></div>")
     write_page(session_file(session_id), f"{title} usage", "".join(body), SESSION_JS)
+
+
+def tool_name(row):
+    return {"codex": "Codex"}.get(row.get("tool") or "claude", "Claude Code")
 
 
 def render_index(by_session):
@@ -887,7 +1071,8 @@ def render_index(by_session):
         total = sum(num(r.get("total_input_tokens")) for r in rows)
         mix = " ".join(f"<span><span class='key' style='background:var(--m-{f})'></span>{fams[f]}</span>"
                        for f in MODEL_FAMILIES + ["other"] if fams.get(f))
-        trs.append(f"<tr><td><a href='{esc(link)}'>{esc(title)}</a></td><td>{esc(rows[0].get('project', ''))}</td>"
+        trs.append(f"<tr><td><a href='{esc(link)}'>{esc(title)}</a></td><td>{esc(tool_name(rows[0]))}</td>"
+                   f"<td>{esc(rows[0].get('project', ''))}</td>"
                    f"<td title='{esc(sid)}'>{esc(sid[:8])}</td><td>{esc(first[:16].replace('T', ' '))}</td>"
                    f"<td>{esc(last[:16].replace('T', ' '))}</td><td class='num' data-v='{len(rows)}'>{len(rows)}</td>"
                    f"<td class='num' data-v='{total}'>{fmt_n(total)}</td><td>{mix}</td></tr>")
@@ -898,7 +1083,7 @@ def render_index(by_session):
             + NOTE
             + "<h2>Sessions</h2><p class='meta'>Newest activity first. Open a session for its charts "
             "and agent table.</p>"
-            "<div class='wrap'><table class='sortable'><thead><tr><th>Session</th><th>Project</th>"
+            "<div class='wrap'><table class='sortable'><thead><tr><th>Session</th><th>Tool</th><th>Project</th>"
             "<th>Id</th><th>First agent (UTC)</th><th>Last agent (UTC)</th><th class='num'>Agents</th>"
             "<th class='num'>Total input</th><th>Agents by model</th></tr></thead>"
             f"<tbody>{''.join(trs)}</tbody></table></div>"
@@ -943,10 +1128,16 @@ def main():
     return 0
 
 
+HOOK_OK = '{"continue": true}'  # Codex needs JSON on stdout for SubagentStop; Claude Code accepts it
+
+
 if __name__ == "__main__":
+    hook_mode = len(sys.argv) == 1
     try:
         code = main()
     except Exception as e:  # never break the session
         print(f"subagent_usage: {e}", file=sys.stderr)
         code = 0
+    if hook_mode:
+        print(HOOK_OK)
     sys.exit(code or 0)

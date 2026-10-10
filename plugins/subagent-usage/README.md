@@ -1,6 +1,7 @@
 # subagent-usage
 
-A Claude Code plugin that records the usage of each subagent and shows it on static HTML pages.
+A plugin for Claude Code and Codex that records the usage of each subagent and shows it on
+static HTML pages.
 
 For each subagent that stops, a `SubagentStop` hook reads the agent transcript and stores 1 row:
 tokens, API calls, tool calls, peak context, active time, the longest turn and, optionally, the
@@ -9,11 +10,11 @@ per model and per role, with 1 trend chart for each role.
 
 ## Requirements
 
-- Claude Code with plugin support.
+- Claude Code or Codex with plugin support.
 - Python 3.11 or later (`tomllib`). No other packages.
 - `git`, only for the line counts.
 
-## Install
+## Install in Claude Code
 
 ```
 /plugin marketplace add jecikpo/jecikpo-marketplace
@@ -30,18 +31,36 @@ install the plugin with the project scope, or disable it in the user scope and e
 { "enabledPlugins": { "subagent-usage@jecikpo-marketplace": true } }
 ```
 
+## Install in Codex
+
+The repository has a Codex marketplace file (`.agents/plugins/marketplace.json`) and a Codex
+manifest (`plugins/subagent-usage/.codex-plugin/plugin.json`). Add the marketplace and install
+the plugin with the Codex plugin commands.
+
+**Codex does not run plugin hooks until you trust them.** After the install, run `/hooks` in
+Codex, review the `SubagentStop` hook of this plugin and trust it. If the hook changes in a new
+version, trust it again.
+
+**The Codex support is not tested with real Codex sessions yet.** It is built from the Codex
+source code and from the bug reports of other usage tools. See "Codex data" below.
+
 ## Use
 
-| Command | Result |
+The plugin has 1 skill, `subagent-usage`. Ask for it in plain words, or call it directly:
+
+| Request | Result |
 |---|---|
-| `/subagent-usage` | Generates all pages again and gives the path of `index.html` |
-| `/subagent-usage backfill <session-id>` | Records all subagents of a past session |
+| "Show the subagent usage pages" | Generates all pages again and gives the path of `index.html` |
+| "Record the subagents of session `<id>`" | Records all subagents of a past session (backfill) |
+
+In Claude Code, the direct call is `/subagent-usage:subagent-usage`.
 
 The same commands without Claude:
 
 ```
 python3 -I plugins/subagent-usage/scripts/subagent_usage.py --html
 python3 -I plugins/subagent-usage/scripts/subagent_usage.py --backfill <session-id | path/to/session.jsonl>
+# Codex: <session-id> is the id of the main session; the path is its rollout-*.jsonl file
 python3 -I plugins/subagent-usage/scripts/subagent_usage.py --help
 ```
 
@@ -59,7 +78,9 @@ again, the row is replaced, not added again.
 | `<project>/.claude/subagent-roles.toml` | Optional project rules and settings |
 
 Environment variables change the paths: `SUBAGENT_USAGE_DIR` (pages and `roles.toml`),
-`SUBAGENT_USAGE_CSV` (the data file) and `CLAUDE_CONFIG_DIR` (the Claude folder).
+`SUBAGENT_USAGE_CSV` (the data file), `CLAUDE_CONFIG_DIR` (the Claude folder) and `CODEX_HOME`
+(the Codex folder, default `~/.codex`). Claude Code and Codex use the same data file and pages;
+the `tool` column and the "Tool" column on the index page show which tool ran the session.
 
 ## Roles
 
@@ -93,10 +114,26 @@ git_stats = true
 to `false` for a project where the agents do not commit. The hook then does not run git, and
 the pages hide the code columns and the code chart lines.
 
+## Codex data
+
+- **Transcripts.** Codex writes 1 rollout file per agent in `~/.codex/sessions/`. A subagent file
+  has `source.subagent.thread_spawn.parent_thread_id` in its first record.
+- **Tokens.** Codex records running totals. The plugin uses the last total minus the total at
+  the start of the agent. A forked subagent file starts with a copy of the parent history and
+  the parent's total; the plugin skips records in the first 1 s after the file starts.
+  **This rule is an assumption.** Check it with real files before you trust the Codex numbers.
+- **Input.** In Codex data, the total input includes the cached input. There is no cache write
+  value in most records.
+- **Output.** Codex records correct output tokens, so Codex agents have an "Output" column.
+- **Description.** Codex has no short task label. The plugin uses `agent_path`, then
+  `agent_nickname`, then the first line of the task message. Add role rules that fit these
+  values, for example `description = '^implement[ _]task'`.
+- **Model colors.** The pages color only the Claude model families. GPT models are gray.
+
 ## Limits
 
-- **Output tokens are not recorded.** The transcripts store `output_tokens` at the start of the
-  stream, so the value is wrong.
+- **Claude Code output tokens are not recorded.** The transcripts store `output_tokens` at the
+  start of the stream, so the value is wrong.
 - **Token counts are not costs.** Cache reads have a lower price per token.
 - **Active time.** A gap of more than 30 min between 2 transcript records counts as an idle gap,
   not as work. Active times in the summaries are sums, so parallel agents count separately.

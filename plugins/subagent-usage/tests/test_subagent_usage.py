@@ -15,6 +15,7 @@ SCRIPT = os.path.join(ROOT, "scripts", "subagent_usage.py")
 def load(tmp):
     """Import a fresh copy of the script with all paths inside tmp."""
     os.environ["CLAUDE_CONFIG_DIR"] = os.path.join(tmp, "claude")
+    os.environ["CODEX_HOME"] = os.path.join(tmp, "codex")
     os.environ.pop("SUBAGENT_USAGE_DIR", None)
     os.environ.pop("SUBAGENT_USAGE_CSV", None)
     spec = importlib.util.spec_from_file_location("subagent_usage", SCRIPT)
@@ -243,12 +244,120 @@ class BackfillTest(unittest.TestCase):
                            capture_output=True, env=env)
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertEqual(p.stderr, "")
+        self.assertEqual(p.stdout.strip(), '{"continue": true}')
         self.assertEqual([r["agent_id"] for r in self.rows()], ["a1"])
 
     def test_hook_never_fails(self):
         p = subprocess.run([sys.executable, "-I", SCRIPT], input="not json", text=True,
                            capture_output=True)
         self.assertEqual(p.returncode, 0)
+
+
+def cx(t, kind, payload):
+    return {"timestamp": f"2026-01-01T10:00:{t:06.3f}Z", "type": kind, "payload": payload}
+
+
+def cx_tokens(t, inp, cached, out, last_inp):
+    tot = {"input_tokens": inp, "cached_input_tokens": cached, "output_tokens": out,
+           "reasoning_output_tokens": 0, "total_tokens": inp + out}
+    last = {"input_tokens": last_inp, "cached_input_tokens": 0, "output_tokens": 0,
+            "reasoning_output_tokens": 0, "total_tokens": last_inp}
+    return cx(t, "event_msg", {"type": "token_count",
+                               "info": {"total_token_usage": tot, "last_token_usage": last}})
+
+
+def cx_meta(tid, parent=None, cwd="/nonexistent/proj", **spawn):
+    p = {"id": tid, "cwd": tid and cwd, "originator": "codex_cli_rs"}
+    p["source"] = {"subagent": {"thread_spawn": {"parent_thread_id": parent, "depth": 1, **spawn}}} if parent else "cli"
+    return cx(0, "session_meta", p)
+
+
+def write_rollout(codex_dir, name, records):
+    d = os.path.join(codex_dir, "sessions", "2026", "01", "01")
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, f"rollout-2026-01-01T10-00-00-{name}.jsonl")
+    with open(path, "w") as f:
+        f.write("".join(json.dumps(r) + "\n" for r in records))
+    return path
+
+
+FRESH = [
+    cx_meta("child-1", "root-1", agent_path="implement_task_1", agent_role="worker"),
+    cx(0.2, "event_msg", {"type": "user_message", "message": "Implement Task 1: parser\nmore"}),
+    cx(2, "turn_context", {"model": "gpt-5.5-codex", "cwd": "/nonexistent/proj"}),
+    cx_tokens(5, 1000, 800, 50, 1000),
+    cx(6, "response_item", {"type": "function_call", "name": "shell", "call_id": "c1"}),
+    cx_tokens(6.5, 1000, 800, 50, 1000),  # repeated record
+    cx_tokens(10, 3000, 2500, 120, 2000),
+]
+
+FORKED = [
+    cx_meta("child-2", "root-1"),
+    cx_tokens(0, 1_000_000, 900_000, 5_000, 50_000),  # parent's running total
+    cx(0, "response_item", {"type": "function_call", "name": "shell", "call_id": "p1"}),
+    cx(0.1, "event_msg", {"type": "user_message", "message": "Review Task 1"}),
+    cx(1.5, "turn_context", {"model": "gpt-5.5-codex"}),
+    cx_tokens(4, 1_060_000, 950_000, 5_300, 60_000),
+]
+
+
+class CodexTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.m = load(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_fresh_subagent(self):
+        path = write_rollout(self.m.CODEX_DIR, "child-1", FRESH)
+        self.assertTrue(self.m.is_codex(path))
+        r = self.m.analyze(path)
+        self.assertEqual(r["tool"], "codex")
+        self.assertEqual((r["total_input_tokens"], r["cache_read_tokens"], r["input_tokens"]), (3000, 2500, 500))
+        self.assertEqual(r["output_tokens"], 120)
+        self.assertEqual((r["api_calls"], r["tool_calls"], r["peak_context"]), (2, 1, 2000))
+        self.assertEqual((r["model"], r["wall_s"]), ("gpt-5.5-codex", 10))
+        self.assertEqual((r["_description"], r["_agent_type"], r["_agent_id"]),
+                         ("implement_task_1", "worker", "child-1"))
+
+    def test_forked_subagent_does_not_count_the_parent(self):
+        r = self.m.analyze(write_rollout(self.m.CODEX_DIR, "child-2", FORKED))
+        self.assertEqual((r["total_input_tokens"], r["cache_read_tokens"], r["output_tokens"]),
+                         (60_000, 50_000, 300))
+        self.assertEqual((r["api_calls"], r["tool_calls"]), (1, 0))
+        self.assertEqual(r["_description"], "Review Task 1")
+
+    def test_backfill_finds_children_at_any_depth(self):
+        write_rollout(self.m.CODEX_DIR, "root-1", [cx_meta("root-1")])
+        write_rollout(self.m.CODEX_DIR, "child-1", FRESH)
+        write_rollout(self.m.CODEX_DIR, "grandchild", [cx_meta("gc-1", "child-1")] + FRESH[1:])
+        write_rollout(self.m.CODEX_DIR, "other", [cx_meta("x-1", "root-9")] + FRESH[1:])
+        self.assertEqual(self.m.backfill("root-1"), 0)
+        with open(self.m.CSV_PATH, newline="") as f:
+            rows = list(csv.DictReader(f))
+        self.assertEqual(sorted(r["agent_id"] for r in rows), ["child-1", "gc-1"])
+        self.assertEqual({(r["session_id"], r["tool"]) for r in rows}, {("root-1", "codex")})
+        gc = next(r for r in rows if r["agent_id"] == "gc-1")  # no agent_path: the task text
+        self.assertEqual(gc["description"], "Implement Task 1: parser")
+        self.assertEqual(self.m.classify(gc["description"], gc["agent_type"], self.m.rules_for(None)),
+                         "implementer")
+        with open(os.path.join(self.m.OUT_DIR, "index.html")) as f:
+            self.assertIn("<td>Codex</td>", f.read())
+        with open(os.path.join(self.m.SESSIONS_DIR, "root-1.html")) as f:
+            self.assertIn("<th class='num'>Output</th>", f.read())
+
+    def test_hook_payload(self):
+        path = write_rollout(self.m.CODEX_DIR, "child-1", FRESH)
+        payload = {"session_id": "root-1", "agent_id": "child-1", "agent_type": "worker",
+                   "agent_transcript_path": path, "cwd": "/nonexistent/proj", "turn_id": "t1"}
+        p = subprocess.run([sys.executable, "-I", SCRIPT], input=json.dumps(payload), text=True,
+                           capture_output=True)
+        self.assertEqual((p.returncode, p.stderr, p.stdout.strip()), (0, "", '{"continue": true}'))
+        with open(self.m.CSV_PATH, newline="") as f:
+            rows = list(csv.DictReader(f))
+        self.assertEqual([(r["agent_id"], r["agent_type"], r["tool"]) for r in rows],
+                         [("child-1", "worker", "codex")])
 
 
 if __name__ == "__main__":
