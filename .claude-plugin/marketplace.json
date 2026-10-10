@@ -1,0 +1,15 @@
+{
+  "name": "subagent-usage",
+  "description": "Marketplace for the subagent-usage plugin",
+  "owner": {
+    "name": "jecikpo"
+  },
+  "plugins": [
+    {
+      "name": "subagent-usage",
+      "description": "Records token usage, active time and git line counts per subagent, and renders static HTML pages with per-role trend charts",
+      "version": "0.1.0",
+      "source": "./"
+    }
+  ]
+}

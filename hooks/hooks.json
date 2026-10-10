@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -I \"${CLAUDE_PLUGIN_ROOT}/scripts/subagent_usage.py\"",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

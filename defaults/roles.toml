@@ -1,0 +1,74 @@
+# Subagent roles for the usage pages.
+#
+# This file is the template. On the first run the plugin copies it to
+# <data dir>/roles.toml (default ~/.claude/subagent-usage/roles.toml). Edit that copy.
+#
+# Each [[role]] block is one rule. The rules are tried from top to bottom; the first
+# rule that matches gives the role.
+#   name          the role name shown on the pages (required)
+#   type          matches the subagent type exactly (for example "Explore")
+#   description   a regular expression, tested against the lowercased agent description
+#                 (Python re.search). Use single quotes: no escapes are needed.
+#   extra_metrics optional; extra lines on this role's chart. Known: "code_added".
+# A rule needs "type" or "description" or both. With both, both must match.
+#
+# A project can add rules in <project>/.claude/subagent-roles.toml (same format).
+# Project rules are tried before the rules in this file. A [default] or a [settings]
+# value there replaces the value here for that project.
+#
+# Apply a change at once: /subagent-usage (or subagent_usage.py --html)
+#
+# The rules below fit the subagent descriptions of the superpowers skills
+# (subagent-driven development, spec and plan reviews). Add your own rules above them.
+
+[settings]
+# git_stats: count the lines of the git commits made in each agent's active time
+# (code_added, commits, ...). Set it to false for a project where the agents do not
+# commit. When false, the hook does not run git, and the pages hide the code columns
+# and the code_added chart lines. Agents recorded while it was false have no line counts.
+git_stats = true
+
+[[role]]
+name = "re-reviewer"
+description = '^re-review'
+
+[[role]]
+name = "implementer"
+description = '^implement task'
+extra_metrics = ["code_added"]
+
+[[role]]
+name = "task reviewer"
+description = '^review task'
+
+[[role]]
+name = "fixer"
+description = '^fix\b|\bfix (task|wave|review)'
+extra_metrics = ["code_added"]
+
+[[role]]
+name = "final reviewer"
+description = 'final.*review'
+
+[[role]]
+name = "spec reviewer"
+description = 'review.*\bspec\b|\bspec\b.*review'
+
+[[role]]
+name = "plan reviewer"
+description = 'review.*\bplan\b|\bplan\b.*review'
+
+[[role]]
+name = "reviewer (other)"
+description = 'review'
+
+[[role]]
+name = "explorer"
+type = "Explore"
+
+[[role]]
+name = "planner"
+type = "Plan"
+
+[default]
+name = "other"
