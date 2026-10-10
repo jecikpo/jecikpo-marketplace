@@ -74,7 +74,7 @@ again, the row is replaced, not added again.
 | `~/.claude/subagent-usage.csv` | The data, 1 row per subagent |
 | `~/.claude/subagent-usage/index.html` | All sessions |
 | `~/.claude/subagent-usage/sessions/<id>.html` | 1 page per session |
-| `~/.claude/subagent-usage/roles.toml` | Your role rules and settings (copied from `defaults/roles.toml` on the first run) |
+| `~/.claude/subagent-usage/roles.toml` | Your role rules and settings. See "Configuration file". |
 | `<project>/.claude/subagent-roles.toml` | Optional project rules and settings |
 
 Environment variables change the paths: `SUBAGENT_USAGE_DIR` (pages and `roles.toml`),
@@ -82,37 +82,140 @@ Environment variables change the paths: `SUBAGENT_USAGE_DIR` (pages and `roles.t
 (the Codex folder, default `~/.codex`). Claude Code and Codex use the same data file and pages;
 the `tool` column and the "Tool" column on the index page show which tool ran the session.
 
-## Roles
+## Configuration file
 
-A role groups agents that do the same type of work, for example "implementer" or
-"task reviewer". The rules are in TOML:
+The configuration file sets 2 things:
 
-```toml
-[[role]]
-name = "implementer"                 # required
-description = '^implement task'      # regex on the lowercased agent description
-type = "general-purpose"             # optional: exact subagent type
-extra_metrics = ["code_added"]       # optional: second line on the role chart
-```
+- **Role rules.** A role groups agents that do the same type of work, for example
+  "implementer" or "task reviewer". The pages show 1 summary row and 1 trend chart per role.
+- **Settings.** At this time there is 1 setting, `git_stats`.
 
-- The first rule that matches gives the role. Project rules are tried first.
-- `[default] name = "other"` is the role for agents that match no rule.
-- The pages calculate the roles each time, so a rule change also applies to old agents.
-- A bad rule does not stop the hook. The pages show a warning box with the file and the rule.
+The format is [TOML](https://toml.io).
 
-The default rules fit the subagent descriptions of the superpowers skills. Add your own rules for
-other workflows.
+### Where the files are
 
-## Settings
+| File | Scope | Required |
+|---|---|---|
+| `~/.claude/subagent-usage/roles.toml` | All projects | Yes. The plugin creates it on the first run. |
+| `<project>/.claude/subagent-roles.toml` | 1 project | No. You create it. |
+
+- **First run.** The plugin copies `defaults/roles.toml` to the global file. This happens on the
+  first hook run, `--html` or `--backfill`. Then the file is yours. An update of the plugin does
+  not change it.
+- **Plugin updates.** To get the default rules of a new plugin version, compare your file with
+  `defaults/roles.toml` and copy the rules that you want. You can also delete your file: the next
+  run creates it again from the new template.
+- **Project folder.** The plugin finds the project file in the working folder of the session
+  (the `project_dir` column). For Codex, `.claude/subagent-roles.toml` is also the path.
+- `SUBAGENT_USAGE_DIR` changes the folder of the global file.
+
+### How the 2 files are merged
+
+1. The rules of the project file come first, then the rules of the global file.
+2. The first rule that matches an agent gives its role. Thus a project rule can replace a global
+   rule.
+3. A `[default]` in the project file replaces the global `[default]` for that project.
+4. Each key in the project `[settings]` replaces the same global key for that project.
+
+### Format
 
 ```toml
 [settings]
 git_stats = true
+
+[[role]]
+name = "implementer"                 # required: the role name on the pages
+description = '^implement task'      # a regular expression on the agent description
+type = "general-purpose"             # the exact subagent type
+extra_metrics = ["code_added"]       # optional: a second line on the role chart
+
+[default]
+name = "other"                       # the role of agents that match no rule
 ```
 
-`git_stats` counts the lines of the git commits made in the active time of each agent. Set it
-to `false` for a project where the agents do not commit. The hook then does not run git, and
-the pages hide the code columns and the code chart lines.
+`[[role]]` keys:
+
+| Key | Required | Meaning |
+|---|---|---|
+| `name` | Yes | The role name on the pages. 2 or more rules can give the same name. |
+| `description` | `description` or `type` or both | A Python regular expression. The plugin tests it with `re.search` against the **lowercased** agent description. Write the pattern in lowercase. |
+| `type` | `description` or `type` or both | The subagent type. It must match exactly, including uppercase letters (for example `Explore`). |
+| `extra_metrics` | No | A list of extra lines for the role chart. Known values: `"code_added"` (code lines added, from git). |
+
+- If a rule has `description` and `type`, both must match.
+- Write regular expressions in single quotes (`'...'`). TOML then keeps each backslash, so
+  `'\bspec\b'` works as written. In double quotes, you must write each backslash 2 times.
+- `^` matches the start of the description. Without `^`, the pattern can match at any position.
+- The agent description is the `description` of the Agent tool call in Claude Code. For Codex,
+  see "Codex data" below.
+
+`[settings]` keys:
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `git_stats` | true or false | `true` | Count the lines of the git commits made in the active time of each agent. |
+
+- **`git_stats = false` at record time.** The hook does not run git, and the line columns of the
+  new rows stay empty. A later change to `true` does not add counts to these rows.
+- **`git_stats = false` at page time.** The pages hide the "Code +", "Code -" and "Commits"
+  columns and the `code_added` chart lines.
+
+### When a change takes effect
+
+- **Roles.** The plugin calculates the roles each time it generates the pages. It does not store
+  them in the CSV. A rule change thus also applies to old agents. To see the change at once, run
+  the skill or `subagent_usage.py --html`.
+- **`git_stats`.** This setting applies to the agents that stop after the change, and to the
+  pages at the next page generation.
+
+### Errors
+
+A configuration error never stops the hook. The pages show a warning box with the file, the rule
+number and the problem.
+
+| Error | Result |
+|---|---|
+| A rule without `name`, or without `description` and `type` | The rule is skipped |
+| A regular expression that is not valid | The rule is skipped |
+| An unknown value in `extra_metrics` | The value is ignored |
+| An unknown key or a wrong value type in `[settings]` | The key is ignored |
+| A TOML syntax error in the global file | The rules of `defaults/roles.toml` are used |
+| A TOML syntax error in the project file | The project file is ignored |
+
+The "by role" section of each page names the files that the plugin used.
+
+### Examples
+
+A project where the agents do not commit and the work is analysis:
+
+```toml
+# <project>/.claude/subagent-roles.toml
+[settings]
+git_stats = false
+
+[[role]]
+name = "analyst"
+description = '\blens\b|^(extract|map|synthesize) '
+
+[default]
+name = "misc"
+```
+
+Codex agents (the description is `agent_path`, the nickname or the first line of the task):
+
+```toml
+[[role]]
+name = "implementer"
+description = '^implement[ _]task|^you are implementing task'
+extra_metrics = ["code_added"]
+
+[[role]]
+name = "explorer"
+type = "explorer"
+```
+
+The default rules fit the subagent descriptions of the superpowers skills
+(subagent-driven development, spec and plan reviews).
 
 ## Codex data
 
