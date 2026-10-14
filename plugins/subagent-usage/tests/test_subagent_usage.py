@@ -94,6 +94,93 @@ class AnalyzeTest(unittest.TestCase):
         self.assertEqual((r["commits"], r["code_added"]), ("", 0))
 
 
+TOOLS = [
+    rec("user", "10:00:00", message={"content": "do it"}),
+    rec("assistant", "10:00:05", requestId="r1", message={"model": "claude-opus-5-5", "usage": {}, "content": [
+        {"type": "tool_use", "id": "u1", "name": "Bash", "input": {"command": "cd /x && cargo test"}},
+        {"type": "tool_use", "id": "u2", "name": "Read", "input": {"file_path": "/x/a.rs"}}]}),
+    rec("user", "10:00:07", message={"content": [
+        {"type": "tool_result", "tool_use_id": "u2", "content": [{"type": "text", "text": "abc"}]}]}),
+    rec("user", "10:00:35", message={"content": [
+        {"type": "tool_result", "tool_use_id": "u1", "content": "x" * 500, "is_error": True}]}),
+]
+
+
+class ToolCallsTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.m = load(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_claude_calls_have_output_size_time_and_errors(self):
+        d = write_session(self.m.CLAUDE_DIR, "s1", {"a1": ("x", "general-purpose", TOOLS)})
+        calls = self.m.analyze(os.path.join(d, "agent-a1.jsonl"))["_tools"]
+        got = [(c["n"], c["tool"], c["prog"], c["in"], c["chars"], c["dur_s"], c["err"]) for c in calls]
+        self.assertEqual(got, [(1, "Bash", "cargo", "cd /x && cargo test", 500, 30, True),
+                               (2, "Read", "", "/x/a.rs", 3, 2, False)])
+
+    def test_source_types(self):
+        d = write_session(self.m.CLAUDE_DIR, "s1", {"a1": ("x", "general-purpose", TOOLS)})
+        calls = self.m.analyze(os.path.join(d, "agent-a1.jsonl"))["_tools"]
+        self.assertEqual([c["src"] for c in calls], [{"command output": 500}, {".rs": 3}])
+        self.assertNotIn("_hint", calls[0])
+        sh = ("shell", self.m.reader_exts("cd x && sed -n 1,40p notes/plan.md | head"))
+        self.assertEqual(self.m.classify_output(sh, "a\nb\n"), {".md": 4})
+        sh = ("shell", self.m.reader_exts("grep -rn foo src/ > out.txt"))
+        self.assertEqual(self.m.classify_output(sh, "src/a.rs:1:x\nREADME.md-2-y\nsummary\n"),
+                         {".rs": 13, ".md": 14, "command output": 8})
+        self.assertEqual(self.m.reader_exts('F=notes/p.md; S=/x; sed -n 1,9p $F; grep -n a "${S}/b.rs"'),
+                         {".md", ".rs"})
+        self.assertEqual(self.m.reader_exts("for f in a.toml b.toml; do cat $f; done"), {".toml"})
+        sh = ("shell", self.m.reader_exts("cat a.rs notes/x.md"))
+        self.assertEqual(self.m.classify_output(sh, "abc"), {"several types": 3})
+
+    def test_shell_prog(self):
+        for cmd, prog in [("SP=/a; R=/b; sed -n 1p f", "sed"), ("A=1 python3 x.py", "python3"),
+                          (["bash", "-lc", "cd /x && rg foo"], "rg"), ("cat f | grep x", "cat"),
+                          ("if [ -d x ]; then ls x; fi", "test"), ("time cargo build", "cargo"),
+                          ("D=$(ls -d ~/x/* | head -1); grep -n y $D", "grep"), ("cd x && \\\n{ sed 1p f; }", "sed")]:
+            self.assertEqual(self.m.shell_prog(cmd), prog)
+
+    def test_codex_calls(self):
+        recs = FRESH[:4] + [
+            cx(6, "response_item", {"type": "function_call", "name": "shell", "call_id": "c1",
+                                    "arguments": json.dumps({"command": ["bash", "-lc", "git status"]})}),
+            cx(8, "response_item", {"type": "function_call_output", "call_id": "c1",
+                                    "output": {"content": "clean", "success": False}}),
+        ]
+        calls = self.m.analyze(write_rollout(self.m.CODEX_DIR, "child-1", recs))["_tools"]
+        self.assertEqual([(c["tool"], c["prog"], c["chars"], c["dur_s"], c["err"]) for c in calls],
+                         [("shell", "git", 5, 2, True)])
+
+    def test_context_per_api_request(self):
+        d = write_session(self.m.CLAUDE_DIR, "s1", {"a1": ("x", "general-purpose", BASIC)})
+        ctx = self.m.analyze(os.path.join(d, "agent-a1.jsonl"))["_context"]
+        self.assertEqual([c["ctx"] for c in ctx], [1210, 3105, 4001])
+        html = self.m.context_section(ctx, 120)
+        self.assertIn("<b>+2,791</b>", html)  # growth = end - start
+        self.assertIn("<b>+1,396</b>", html)  # growth per API call
+        self.assertIn("<b>+1,895 at 10:01:20 UTC</b>", html)  # largest jump
+
+    def test_agent_page_is_written_and_linked(self):
+        write_session(self.m.CLAUDE_DIR, "s1", {"a1": ("Implement Task 1: x", "general-purpose", TOOLS)})
+        self.m.backfill("s1")
+        with open(os.path.join(self.m.AGENTS_DIR, "a1.json")) as f:
+            data = json.load(f)
+        self.assertEqual((len(data["calls"]), len(data["context"])), (2, 1))
+        with open(os.path.join(self.m.AGENTS_DIR, "a1.html")) as f:
+            page = f.read()
+        self.assertIn("Shell programs", page)
+        self.assertIn("<td><code>.rs</code></td>", page)
+        self.assertIn("<b>503</b> characters", page)
+        with open(os.path.join(self.m.SESSIONS_DIR, "s1.html")) as f:
+            session = f.read()
+        self.assertIn("href='../agents/a1.html'", session)
+        self.assertIn("This session: tool output by source", session)
+
+
 class GitStatsTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

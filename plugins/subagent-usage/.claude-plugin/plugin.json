@@ -1,7 +1,7 @@
 {
   "name": "subagent-usage",
   "description": "Records token usage, active time and git line counts per subagent, and renders static HTML pages with per-role trend charts",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "author": {
     "name": "jecikpo"
   },

@@ -3,7 +3,8 @@
 
 Reads the hook JSON on stdin, parses the subagent transcript, adds or replaces one row
 (key: agent_id) in the CSV file, and regenerates the HTML pages: index.html (all sessions)
-and sessions/<session-id>.html (one page per session).
+sessions/<session-id>.html (one page per session) and agents/<agent-id>.html (the tool calls of
+one agent; the data is in agents/<agent-id>.json).
 
 Paths (environment variables, all optional):
   SUBAGENT_USAGE_DIR  pages and roles.toml   default <claude dir>/subagent-usage
@@ -40,6 +41,7 @@ CODEX_DIR = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
 CSV_PATH = os.environ.get("SUBAGENT_USAGE_CSV") or os.path.join(CLAUDE_DIR, "subagent-usage.csv")
 OUT_DIR = os.environ.get("SUBAGENT_USAGE_DIR") or os.path.join(CLAUDE_DIR, "subagent-usage")
 SESSIONS_DIR = os.path.join(OUT_DIR, "sessions")
+AGENTS_DIR = os.path.join(OUT_DIR, "agents")  # <id>.json (tool calls) and <id>.html per agent
 FIELDS = [
     "logged_at", "started_at", "tool", "project", "project_dir", "session_id", "agent_id",
     "agent_type", "model", "description", "wall_s", "api_calls", "tool_calls", "input_tokens",
@@ -231,6 +233,211 @@ def git_stats(repo, segments):
     return out
 
 
+# ---------------------------------------------------------------- tool calls
+#
+# Each tool call is stored in <AGENTS_DIR>/<agent id>.json, because transcripts are deleted
+# after some time (cleanupPeriodDays). Fields: n (call number), t (start, ms), tool,
+# prog (first program of a shell command), in (short input), chars (characters of the tool
+# result that went into the context), dur_s (result time - call time), err.
+SHELL_TOOLS = {"Bash", "bash", "shell", "exec_command", "local_shell", "local_shell_call", "shell_command"}
+TOOL_GROUPS = [  # fixed color per group; everything else is "other" (gray)
+    ("shell", SHELL_TOOLS),
+    ("read", {"Read", "NotebookRead", "view_image", "read_file"}),
+    ("edit", {"Edit", "MultiEdit", "Write", "NotebookEdit", "apply_patch"}),
+]
+SHELL_KEYWORDS = {"if", "then", "else", "elif", "do", "while", "until", "!", "{", "(", "time", "exec"}
+SHELL_SKIP = re.compile(r"^(cd|export|set|source|\.|true|:)$|^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def tool_group(name):
+    return next((g for g, names in TOOL_GROUPS if name in names), "other")
+
+
+def output_text(x):
+    """The text of a tool result (string, content list or Codex output object)."""
+    if isinstance(x, str):
+        return x
+    if isinstance(x, list):
+        return "".join(output_text(i.get("text", "") if isinstance(i, dict) else i) for i in x)
+    if isinstance(x, dict):
+        return output_text(x.get("content") or x.get("output") or x.get("text") or "")
+    return ""
+
+
+def text_len(x):
+    return len(output_text(x))
+
+
+# Source types of tool output. A file extension (".rs", ".md"), or one of these names:
+SRC_COMMAND = "command output"   # shell output with no file argument (cargo, git, ...)
+SRC_SEVERAL = "several types"    # shell output of files with 2 or more extensions
+SRC_OTHER = "other tools"        # tools with no file (Agent, Skill, WebFetch, ...)
+FILE_TOOLS = {"Read", "Edit", "MultiEdit", "Write", "NotebookEdit", "NotebookRead", "read_file", "view_image"}
+READERS = {"cat", "sed", "head", "tail", "grep", "egrep", "rg", "awk", "nl", "less", "more", "diff",
+           "wc", "cut", "sort", "uniq", "jq", "bat", "tac", "column", "strings", "xxd", "od", "cmp"}
+PATH_TOKEN = re.compile(r"^[\w./~*?{}\[\]+@%-]*[\w*}]\.([A-Za-z][A-Za-z0-9]{0,7})$")
+LINE_PREFIX = re.compile(r"^(?:\./)?[^\s:]*?\.([A-Za-z][A-Za-z0-9]{0,7})(?::|-\d+-)")
+
+
+def ext_of(path):
+    m = PATH_TOKEN.match(os.path.basename(str(path).strip("'\"")))
+    return "." + m.group(1).lower() if m else ""
+
+
+def reader_exts(cmd):
+    """Extensions of the file arguments of reader programs (cat, sed, grep, ...) in a command."""
+    if isinstance(cmd, list):
+        cmd = cmd[-1] if len(cmd) > 2 and cmd[-2] in ("-c", "-lc") else " ".join(map(str, cmd))
+    exts = set()
+    text = drop_substitutions(str(cmd).replace("\\\n", " "))
+    env = {}  # shell variable -> values: F=x.md, or the list of a for loop
+    for part in re.split(r"&&|\|\||;|\n|\|", text):
+        words = part.split()
+        if not words:
+            continue
+        if words[0] == "for" and len(words) > 3 and words[2] == "in":
+            env[words[1]] = words[3:]
+            continue
+        for w in words:
+            m = re.match(r"^([A-Za-z_]\w*)=(\S+)$", w)
+            if not m:
+                break
+            env[m.group(1)] = [m.group(2).strip("'\"")]
+        if shell_prog(part) not in READERS:
+            continue
+        skip = False
+        for w in words:
+            if skip or w.startswith(">") or w.startswith("<"):
+                skip = w in (">", ">>", "<", "2>", "&>")
+                continue
+            if w in ("2>", "&>"):
+                skip = True
+                continue
+            if w.startswith("-") or "=" in w.split("/")[0]:
+                continue
+            for v in expand_vars(w.strip("'\""), env):
+                if ext_of(v):
+                    exts.add(ext_of(v))
+    return exts
+
+
+def expand_vars(word, env):
+    """The values of a word after $NAME and ${NAME} are replaced (1 value per list item)."""
+    m = re.search(r"\$\{?([A-Za-z_]\w*)\}?", word)
+    if not m or m.group(1) not in env:
+        return [word]
+    return [v for val in env[m.group(1)]
+            for v in expand_vars(word[:m.start()] + val + word[m.end():], env)]
+
+
+def classify_output(call_hint, text):
+    """{source type: characters} for 1 tool result. call_hint: ("file", ext), ("shell", exts) or None."""
+    kind, val = call_hint or (None, None)
+    if kind == "file":
+        return {val or SRC_OTHER: len(text)} if text else {}
+    out = defaultdict(int)
+    rest = 0
+    for line in text.splitlines(keepends=True):
+        m = LINE_PREFIX.match(line) if kind == "shell" or kind == "search" else None
+        if m:
+            out["." + m.group(1).lower()] += len(line)
+        else:
+            rest += len(line)
+    if rest:
+        if kind == "shell" and val:
+            out[next(iter(val)) if len(val) == 1 else SRC_SEVERAL] += rest
+        else:
+            out[SRC_COMMAND if kind in ("shell", "search") else SRC_OTHER] += rest
+    return dict(out)
+
+
+def drop_substitutions(cmd):
+    """Remove $(...) and `...` blocks, so that D=$(ls -d x); cat $D gives cat."""
+    out, depth, i = [], 0, 0
+    while i < len(cmd):
+        if cmd.startswith("$(", i):
+            depth += 1
+            i += 2
+            continue
+        ch = cmd[i]
+        if depth and ch == "(":
+            depth += 1
+        elif depth and ch == ")":
+            depth -= 1
+        elif not depth:
+            out.append(ch)
+        i += 1
+    return re.sub(r"`[^`]*`", "", "".join(out))
+
+
+def shell_prog(cmd):
+    """First program of a shell command: skips cd, variable assignments and export."""
+    if isinstance(cmd, list):
+        cmd = cmd[-1] if len(cmd) > 2 and cmd[-2] in ("-c", "-lc") else " ".join(map(str, cmd))
+    for part in re.split(r"&&|\|\||;|\n|\|", drop_substitutions(str(cmd).replace("\\\n", " "))):
+        for word in part.split():
+            if word in ("[", "[[", "test"):
+                return "test"
+            if word in SHELL_KEYWORDS:
+                continue  # if, then, do, time, ...: the program comes next
+            if SHELL_SKIP.match(word):
+                if "=" in word:
+                    continue  # A=1 cmd: the program comes next
+                break
+            return os.path.basename(word.strip("'\"(){}"))
+    return ""
+
+
+def input_summary(inp):
+    """A short text for the tooltip: the command, path, pattern or first text value."""
+    if isinstance(inp, str):
+        try:
+            inp = json.loads(inp)
+        except ValueError:
+            return inp.strip().splitlines()[0][:160] if inp.strip() else ""
+    if not isinstance(inp, dict):
+        return ""
+    for k in ("command", "cmd", "file_path", "path", "pattern", "url", "query", "skill",
+              "description", "message", "prompt"):
+        v = inp.get(k)
+        if isinstance(v, list):
+            v = v[-1] if len(v) > 2 and v[-2] in ("-c", "-lc") else " ".join(map(str, v))
+        if v:
+            return " ".join(str(v).split())[:160]
+    return ""
+
+
+def new_call(n, t, name, inp):
+    shell = name in SHELL_TOOLS
+    if shell and isinstance(inp, str):
+        try:
+            inp = json.loads(inp)
+        except ValueError:
+            pass
+    cmd = (inp.get("command") or inp.get("cmd") or "") if isinstance(inp, dict) else inp
+    path = (inp.get("file_path") or inp.get("path") or inp.get("notebook_path") or "") if isinstance(inp, dict) else ""
+    if shell:
+        hint = ("shell", reader_exts(cmd))
+    elif name in FILE_TOOLS:
+        hint = ("file", ext_of(path))
+    elif name in ("Grep", "Glob", "grep", "glob", "list_dir"):
+        hint = ("search", None)
+    else:
+        hint = None
+    return {"n": n, "t": int(t.timestamp() * 1000) if t else 0, "tool": name,
+            "prog": shell_prog(cmd) if shell else "", "in": input_summary(inp),
+            "chars": 0, "src": {}, "dur_s": None, "err": False, "_hint": hint}
+
+
+def end_call(c, t, output, err):
+    text = output_text(output)
+    c["chars"] = len(text)
+    c["src"] = classify_output(c.get("_hint"), text)
+    c["err"] = bool(err)
+    if t and c["t"]:
+        c["dur_s"] = max(round(t.timestamp() - c["t"] / 1000, 1), 0)
+
+
 def is_codex(path):
     """Codex rollout files start with a session_meta record; Claude Code files never do."""
     try:
@@ -258,6 +465,8 @@ def analyze_claude(path):
     prev_user = None
     longest = 0.0
     model = None
+    calls = {}  # tool_use id -> call, in call order
+    ctx = []  # context size of each API request
     with open(path) as f:
         for line in f:
             try:
@@ -282,6 +491,10 @@ def analyze_claude(path):
             msg = r.get("message") or {}
             if r.get("type") == "user" and t:
                 prev_user = t
+            if r.get("type") == "user" and isinstance(msg.get("content"), list):
+                for c in msg["content"]:
+                    if isinstance(c, dict) and c.get("type") == "tool_result" and c.get("tool_use_id") in calls:
+                        end_call(calls[c["tool_use_id"]], t, c.get("content"), c.get("is_error"))
             if r.get("type") != "assistant":
                 continue
             if msg.get("model") == "<synthetic>":
@@ -291,9 +504,15 @@ def analyze_claude(path):
             for c in msg.get("content") or []:
                 if isinstance(c, dict) and c.get("type") == "tool_use":
                     tool_calls += 1
+                    if c.get("id") and c["id"] not in calls:
+                        calls[c["id"]] = new_call(len(calls) + 1, t, c.get("name") or "?", c.get("input"))
             rid = r.get("requestId")
             if rid and rid not in reqs:
                 reqs[rid] = msg.get("usage") or {}
+                u = reqs[rid]
+                ctx.append({"t": int(t.timestamp() * 1000) if t else 0,
+                            "ctx": u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0)
+                            + u.get("cache_creation_input_tokens", 0)})
                 if prev_user and t:
                     turn = (t - prev_user).total_seconds()
                     if turn <= IDLE_GAP_S:
@@ -320,6 +539,8 @@ def analyze_claude(path):
         "project_dir": repo or "",
         "tool": "claude",
         "output_tokens": "",
+        "_tools": [{k: v for k, v in c.items() if not k.startswith("_")} for c in calls.values()],
+        "_context": ctx,
         **git_fields(repo, segments + ([(seg_start.timestamp(), last.timestamp())] if last else [])),
     }
 
@@ -343,6 +564,7 @@ def git_fields(repo, segments):
 # and bug reports of other usage tools).
 CODEX_REPLAY_S = 1.0
 CODEX_TOOL_ITEMS = {"function_call", "custom_tool_call", "local_shell_call", "web_search_call"}
+CODEX_OUTPUT_ITEMS = {"function_call_output", "custom_tool_call_output", "local_shell_call_output"}
 CODEX_USAGE_KEYS = ("input_tokens", "cached_input_tokens", "cache_write_input_tokens",
                     "output_tokens", "total_tokens")
 
@@ -384,6 +606,8 @@ def analyze_codex(path):
     segments = []
     model = None
     task = ""
+    calls = {}  # call_id -> call
+    ctx = []  # context size of each API request
     for t, kind, p in recs:
         own = t.timestamp() > cut
         if kind == "turn_context" and p.get("model"):
@@ -397,13 +621,22 @@ def analyze_codex(path):
             elif total["total_tokens"] not in seen_totals:  # rollouts can repeat a record
                 api_calls += 1
                 lu = p["info"].get("last_token_usage") or {}
-                peak = max(peak, (lu.get("input_tokens") or 0) + (lu.get("cache_write_input_tokens") or 0))
+                size = (lu.get("input_tokens") or 0) + (lu.get("cache_write_input_tokens") or 0)
+                peak = max(peak, size)
+                ctx.append({"t": int(t.timestamp() * 1000), "ctx": size})
             seen_totals.add(total["total_tokens"])
             final = total
         if not own:
             continue
         if kind == "response_item" and p.get("type") in CODEX_TOOL_ITEMS:
             tool_calls += 1
+            cid = p.get("call_id") or p.get("id") or f"_{tool_calls}"
+            name = p.get("name") or p["type"].removesuffix("_call")
+            inp = p.get("arguments") or p.get("input") or p.get("action") or {}
+            calls.setdefault(cid, new_call(len(calls) + 1, t, name, inp))
+        if kind == "response_item" and p.get("type") in CODEX_OUTPUT_ITEMS and p.get("call_id") in calls:
+            out = p.get("output")
+            end_call(calls[p["call_id"]], t, out, isinstance(out, dict) and out.get("success") is False)
         if kind == "event_msg" and p.get("type") in ("error", "stream_error"):
             api_errors += 1
         if last is None:
@@ -444,6 +677,8 @@ def analyze_codex(path):
         "_agent_id": meta.get("id", ""),
         "_agent_type": spawn.get("agent_role") or spawn.get("agent_type") or "",
         "_description": spawn.get("agent_path") or spawn.get("agent_nickname") or first_line[:120],
+        "_tools": [{k: v for k, v in c.items() if not k.startswith("_")} for c in calls.values()],
+        "_context": ctx,
         **git_fields(repo, segments),
     }
 
@@ -465,8 +700,10 @@ def add_row(hook):
     agent_id = agent_id or row.pop("_agent_id", "") or os.path.basename(path)[len("agent-"):-len(".jsonl")]
     agent_type = hook.get("agent_type") or meta.get("agentType") or row.get("_agent_type", "")
     description = meta.get("description") or row.get("_description", "")
+    data = {"calls": row.pop("_tools", []), "context": row.pop("_context", [])}
     for k in ("_agent_id", "_agent_type", "_description"):
         row.pop(k, None)
+    write_agent_data(agent_id, data)
     row.update({
         "logged_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "project": os.path.basename(hook.get("cwd") or row.get("project_dir") or ""),
@@ -479,6 +716,30 @@ def add_row(hook):
     })
     upsert_row(row)
     return True
+
+
+def agent_file(agent_id, ext):
+    safe = re.sub(r"[^A-Za-z0-9_-]", "_", agent_id or "unknown")
+    return os.path.join(AGENTS_DIR, f"{safe}.{ext}")
+
+
+def write_agent_data(agent_id, data):
+    """data: {"calls": [tool calls], "context": [{"t": ms, "ctx": tokens} per API request]}."""
+    os.makedirs(AGENTS_DIR, exist_ok=True)
+    path = agent_file(agent_id, "json")
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
+        json.dump({"agent_id": agent_id, **data}, f, separators=(",", ":"))
+    os.replace(tmp, path)
+
+
+def read_agent_data(agent_id):
+    try:
+        with open(agent_file(agent_id, "json")) as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return {"calls": d.get("calls") or [], "context": d.get("context") or []}
 
 
 def upsert_row(row):
@@ -631,11 +892,13 @@ PAGE_CSS = """
 :root { --bg:#fafaf9; --fg:#1c1917; --muted:#78716c; --line:#e7e5e4; --card:#fcfcfb;
   --head:#f5f5f4; --accent:#9a3412; --bar:#fdba74; --link:#1c5cab;
   --m-opus:#2a78d6; --m-sonnet:#eb6834; --m-fable:#1baf7a; --m-other:#8f8d88;
-  --trend:#b8b5ae; --grid:#e7e5e4; --axis:#78716c; --ink2:#3d3c39; }
+  --trend:#b8b5ae; --grid:#e7e5e4; --axis:#78716c; --ink2:#3d3c39;
+  --t-shell:#2a78d6; --t-read:#eb6834; --t-edit:#1baf7a; --t-other:#8f8d88; }
 @media (prefers-color-scheme: dark) { :root { --bg:#141413; --fg:#f5f5f4; --muted:#a8a29e;
   --line:#3a3936; --card:#1a1a19; --head:#262624; --accent:#fdba74; --bar:#9a3412; --link:#86b6ef;
   --m-opus:#3987e5; --m-sonnet:#d95926; --m-fable:#199e70; --m-other:#8f8d88;
-  --trend:#55534e; --grid:#2e2d2a; --axis:#a8a29e; --ink2:#d6d4cc; } }
+  --trend:#55534e; --grid:#2e2d2a; --axis:#a8a29e; --ink2:#d6d4cc;
+  --t-shell:#3987e5; --t-read:#d95926; --t-edit:#199e70; --t-other:#8f8d88; } }
 * { box-sizing:border-box; }
 body { margin:0; padding:24px 16px; background:var(--bg); color:var(--fg);
   font:14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
@@ -688,6 +951,15 @@ code { font-size:12px; }
   border:1px solid var(--line); border-radius:6px; padding:6px 8px; font-size:12px; line-height:1.4;
   box-shadow:0 2px 8px rgba(0,0,0,.15); max-width:260px; }
 .tip b { font-weight:600; }
+.tip .in { font-family:ui-monospace, Menlo, monospace; font-size:11px; word-break:break-all; }
+#toolchart, #ctxchart { width:100%; }
+.stats { display:flex; flex-wrap:wrap; gap:8px; margin:8px 0 12px; }
+.stat { border:1px solid var(--line); border-radius:8px; background:var(--card); padding:6px 10px; min-width:120px; }
+.stat span { display:block; color:var(--muted); font-size:12px; }
+.stat b { font-size:16px; font-variant-numeric:tabular-nums; }
+td.in { white-space:normal; min-width:260px; max-width:640px; word-break:break-all;
+  font-family:ui-monospace, Menlo, monospace; font-size:12px; }
+.err { color:var(--accent); font-weight:600; }
 """
 
 SORT_JS = """
@@ -875,6 +1147,133 @@ window.addEventListener('resize', () => { clearTimeout(resizeTimer); resizeTimer
 renderCharts();
 """
 
+AGENT_JS = """
+const DATA = JSON.parse(document.getElementById('agent-data').textContent);
+const NS = 'http://www.w3.org/2000/svg';
+const trim = (v, d) => String(+v.toFixed(d));
+const compact = v => v >= 1e6 ? trim(v / 1e6, 2) + 'M' : v >= 1e3 ? trim(v / 1e3, 1) + 'K' : trim(v, 0);
+const full = v => Math.round(v).toLocaleString('en-US');
+const fmtDur = v => v < 60 ? trim(v, 1) + ' s' : v < 3600 ? trim(v / 60, 1) + ' min' : trim(v / 3600, 2) + ' h';
+const clock = ms => new Date(ms).toISOString().slice(11, 19) + ' UTC';
+function el(tag, attrs, parent) {
+  const e = document.createElementNS(NS, tag);
+  for (const k in attrs) e.setAttribute(k, attrs[k]);
+  if (parent) parent.appendChild(e);
+  return e;
+}
+function niceMax(v) {
+  if (v <= 0) return 1;
+  const p = 10 ** Math.floor(Math.log10(v)), n = v / p;
+  return (n <= 1 ? 1 : n <= 2 ? 2 : n <= 2.5 ? 2.5 : n <= 5 ? 5 : 10) * p;
+}
+function niceStep(range, count) {
+  const raw = range / count, p = 10 ** Math.floor(Math.log10(raw || 1)), n = raw / p;
+  return (n <= 1 ? 1 : n <= 2 ? 2 : n <= 5 ? 5 : 10) * p;
+}
+function line(text, cls) {
+  const e = document.createElement('div'); if (cls) e.className = cls; e.textContent = text; return e;
+}
+// One line chart with dots and a crosshair tooltip. o: x(d), y(d), xmin, xmax, xticks (values),
+// xlabel(v), color(d), head(d) (tooltip title), tip(d, i) (list of tooltip nodes), lineOnly, aria.
+function chart(card, ds, o) {
+  card.querySelectorAll('svg, .tip').forEach(e => e.remove());
+  const n = ds.length;
+  if (!n) return;
+  const W = Math.max(card.clientWidth - 24, 280), H = 240, m = { l: 48, r: 12, t: 10, b: 26 };
+  const svg = el('svg', { viewBox: `0 0 ${W} ${H}`, height: H, role: 'img', 'aria-label': o.aria }, card);
+  const pw = W - m.l - m.r, span = (o.xmax - o.xmin) || 1;
+  const x = v => m.l + (o.xmax === o.xmin ? 0.5 : (v - o.xmin) / span) * pw;
+  const ymax = niceMax(Math.max(...ds.map(o.y)));
+  const y = v => m.t + (1 - v / ymax) * (H - m.t - m.b);
+  [0, ymax / 2, ymax].forEach(v => {
+    el('line', { class: 'gridline', x1: m.l, x2: W - m.r, y1: y(v), y2: y(v) }, svg);
+    el('text', { x: m.l - 6, y: y(v) + 4, 'text-anchor': 'end' }, svg).textContent = compact(v);
+  });
+  o.xticks.forEach(v => { el('text', { x: x(v), y: H - 6, 'text-anchor': 'middle' }, svg).textContent = o.xlabel(v); });
+  if (n > 1) el('path', { class: 'trend', style: o.lineOnly ? `stroke:${o.color(ds[0])}` : '',
+    d: ds.map((d, i) => `${i ? 'L' : 'M'}${x(o.x(d)).toFixed(1)},${y(o.y(d)).toFixed(1)}`).join('') }, svg);
+  // o.lineOnly: dense data shows only the line; the dot of the hovered point appears on hover.
+  const r0 = o.lineOnly && n > 60 ? 0 : n > 150 ? 3 : 4;
+  const dots = ds.map(d => el('circle', { class: 'dot', cx: x(o.x(d)), cy: y(o.y(d)), r: r0, style: `fill:${o.color(d)}` }, svg));
+  const cross = el('line', { class: 'cross', y1: m.t, y2: H - m.b, visibility: 'hidden' }, svg);
+  const tip = document.createElement('div'); tip.className = 'tip'; tip.hidden = true; card.appendChild(tip);
+  const hit = el('rect', { x: m.l - 8, y: 0, width: pw + 16, height: H, fill: 'transparent' }, svg);
+  let cur = -1;
+  hit.addEventListener('mousemove', ev => {
+    const r = svg.getBoundingClientRect(), px = (ev.clientX - r.left) * W / r.width;
+    let i = 0;
+    ds.forEach((d, j) => { if (Math.abs(x(o.x(d)) - px) < Math.abs(x(o.x(ds[i])) - px)) i = j; });
+    if (i === cur) return;
+    if (cur >= 0) dots[cur].setAttribute('r', r0);
+    cur = i; dots[i].setAttribute('r', Math.max(r0 + 2, 5));
+    const d = ds[i], cx = x(o.x(d));
+    cross.setAttribute('x1', cx); cross.setAttribute('x2', cx); cross.setAttribute('visibility', 'visible');
+    const b = document.createElement('b');
+    const k = document.createElement('span'); k.className = 'key'; k.style.background = o.color(d);
+    b.append(k, o.head(d, i));
+    tip.replaceChildren(b, ...o.tip(d, i));
+    tip.hidden = false;
+    tip.style.left = Math.min(cx * r.width / W + 12, card.clientWidth - tip.offsetWidth - 4) + 'px';
+    tip.style.top = (svg.offsetTop + 8) + 'px';
+  });
+  hit.addEventListener('mouseleave', () => {
+    if (cur >= 0) dots[cur].setAttribute('r', r0);
+    cur = -1; cross.setAttribute('visibility', 'hidden'); tip.hidden = true;
+  });
+}
+function ticks(min, max, count) {
+  const step = niceStep(max - min, count), out = [];
+  for (let v = Math.ceil(min / step) * step; v <= max + 1e-9; v += step) out.push(v);
+  return out;
+}
+
+// Context: x = time since the agent start, in s, min or h (1 unit per chart).
+function drawContext() {
+  const card = document.getElementById('ctxchart'), ds = DATA.context;
+  if (!card || !ds.length) return;
+  const t0 = DATA.start || ds[0].t, sec = d => (d.t - t0) / 1000;
+  const max = Math.max(sec(ds[ds.length - 1]), 1);
+  const [div, unit] = max < 120 ? [1, 's'] : max < 7200 ? [60, 'min'] : [3600, 'h'];
+  const tv = ticks(0, max / div, 8).map(v => v * div);
+  chart(card, ds, {
+    x: sec, y: d => d.ctx, xmin: 0, xmax: max, xticks: tv, xlabel: v => trim(v / div, 1) + (v ? '' : ' ' + unit),
+    color: () => `var(--m-${DATA.family})`, lineOnly: true, aria: 'Context tokens of each API request over time',
+    head: (d, i) => `API call ${i + 1} · ${fmtDur(sec(d))} after start`,
+    tip: (d, i) => {
+      const out = [line(`Context: ${full(d.ctx)} tokens`)];
+      if (i) { const g = d.ctx - ds[i - 1].ctx; out.push(line(`${g >= 0 ? '+' : ''}${full(g)} since the previous API call`)); }
+      out.push(line(clock(d.t), 'small'));
+      return out;
+    },
+  });
+}
+
+// Tool output: x = call number, y = characters of the tool result. Dot color = tool group.
+function drawTools() {
+  const card = document.getElementById('toolchart'), ds = DATA.calls;
+  if (!card || !ds.length) return;
+  const n = ds.length, tv = ticks(1, n, 10);
+  if (tv[0] !== 1) tv.unshift(1);
+  chart(card, ds, {
+    x: d => d.n, y: d => d.chars, xmin: 1, xmax: n, xticks: tv, xlabel: v => String(v),
+    color: d => `var(--t-${d.group})`, aria: 'Characters of tool output per tool call, in call order',
+    head: d => `#${d.n} · ${d.tool}${d.prog ? ' · ' + d.prog : ''}`,
+    tip: d => {
+      const out = [];
+      if (d.in) out.push(line(d.in, 'in'));
+      out.push(line(`Output: ${full(d.chars)} characters` + (d.dur_s != null ? ` · ${fmtDur(d.dur_s)}` : '')));
+      if (d.err) out.push(line('Error result', 'err'));
+      if (d.t) out.push(line(clock(d.t), 'small'));
+      return out;
+    },
+  });
+}
+function draw() { drawContext(); drawTools(); }
+let resizeTimer;
+window.addEventListener('resize', () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(draw, 150); });
+draw();
+"""
+
 COLS = [  # (header, field, numeric, formatter)
     ("Started (UTC)", "started_at", False, lambda v: v.replace("T", " ")[:16]),
     ("Model", "model", False, short_model),
@@ -993,6 +1392,10 @@ def render_session(session_id, rows):
             f"project {esc(first.get('project', ''))} &middot; "
             f"session {esc(session_id)} &middot; {len(rows)} subagents &middot; {esc(span)}. "
             f"Generated {generated()} UTC.</p>", NOTE, summaries(rows, "This session")]
+    agent_calls = [d["calls"] for d in (read_agent_data(r.get("agent_id", "")) for r in rows) if d]
+    if agent_calls:
+        body.append("<h2>This session: tool output by source</h2><p class='note'>" + SOURCE_NOTE
+                    + f" Data from {len(agent_calls)} of {len(rows)} agents.</p>" + source_summary(agent_calls))
 
     metric_opts = "".join(f"<option value='{k}'>{v}</option>" for k, v in [
         ("total", "Total input tokens"), ("wall", "Wall time"), ("peak", "Peak context"),
@@ -1027,7 +1430,7 @@ def render_session(session_id, rows):
     body.append(f"<script id='role-extra' type='application/json'>{json.dumps(role_extra)}</script>")
 
     body.append("<h2>Agents</h2><p class='meta'>Click a column header to sort. The filter above "
-                "also applies to this table.</p>")
+                "also applies to this table. Click a description to open the tool page of the agent.</p>")
     git_on = rules_for(first.get("project_dir"))["settings"]["git_stats"]
     has_output = any(r.get("output_tokens") not in ("", None) for r in rows)
     cols = [c for c in COLS if (git_on or c[1] not in GIT_FIELDS)
@@ -1043,11 +1446,196 @@ def render_session(session_id, rows):
             text = esc(fmt(v))
             if field == "model":
                 text = f"<span class='key' style='background:var(--m-{family(fmt(v))})'></span>{text}"
+            if field == "description" and agent_link(r):
+                text = f"<a href='{esc(agent_link(r))}'>{text or '(no description)'}</a>"
             tds.append(f"<td class='{cls}'{dv}>{text}</td>")
         trs.append(f"<tr>{''.join(tds)}</tr>")
     body.append(f"<div class='wrap'><table id='agents' class='sortable'><thead><tr>{head}</tr></thead>"
                 f"<tbody>{''.join(trs)}</tbody></table></div>")
     write_page(session_file(session_id), f"{title} usage", "".join(body), SESSION_JS)
+    for r in rows:
+        render_agent(r, role_of(r), title)
+
+
+GROUP_LABELS = {"shell": "shell", "read": "read", "edit": "edit / write", "other": "other"}
+
+
+def tool_key(name):
+    return f"<span class='key' style='background:var(--t-{tool_group(name)})'></span>{esc(name)}"
+
+
+def share_cell(v, total):
+    share = 100 * v / (total or 1)
+    return (f"<td class='num bar' data-v='{share:.3f}'><span style='width:{share:.1f}%'></span>"
+            f"<b>{share:.1f}%</b></td>")
+
+
+def tool_summary(calls, label, key, key_html):
+    """Table: 1 row per key, with the share of calls and the share of output characters."""
+    agg = defaultdict(lambda: [0, 0, 0, 0, 0.0])
+    for c in calls:
+        a = agg[key(c)]
+        a[0] += 1
+        a[1] += c.get("chars", 0)
+        a[2] = max(a[2], c.get("chars", 0))
+        a[3] += 1 if c.get("err") else 0
+        a[4] += c.get("dur_s") or 0
+    n_total, c_total = len(calls), sum(a[1] for a in agg.values())
+    out = [f"<div class='wrap'><table class='sortable'><thead><tr><th>{label}</th>"
+           "<th class='num'>Calls</th><th class='num'>Share of calls</th><th class='num'>Output chars</th>"
+           "<th class='num'>Share of output</th><th class='num'>Largest output</th>"
+           "<th class='num'>Errors</th><th class='num'>Tool time</th></tr></thead><tbody>"]
+    for k, (n, ch, big, err, dur) in sorted(agg.items(), key=lambda kv: (-kv[1][0], -kv[1][1])):
+        out.append(f"<tr><td>{key_html(k)}</td><td class='num' data-v='{n}'>{n}</td>{share_cell(n, n_total)}"
+                   f"<td class='num' data-v='{ch}'>{fmt_n(ch)}</td>{share_cell(ch, c_total)}"
+                   f"<td class='num' data-v='{big}'>{fmt_n(big)}</td><td class='num' data-v='{err}'>{err}</td>"
+                   f"<td class='num' data-v='{dur:.1f}'>{fmt_dur(dur)}</td></tr>")
+    out.append("</tbody></table></div>")
+    return "".join(out)
+
+
+SOURCE_NOTE = ("Each tool result is assigned to a source type: the file extension for Read, Edit and "
+               "Write; for each output line with a file prefix (<code>src/lib.rs:12:</code> from grep), the "
+               "extension of that file; for other shell output, the extension of the files that "
+               "<code>cat</code>, <code>sed</code>, <code>grep</code> and other reader programs read. "
+               "<i>command output</i> = shell output with no file argument (cargo, git, python3, ...). "
+               "<i>several types</i> = 1 shell output from files of 2 or more types. The counts are "
+               "characters of tool output, not tokens. The task prompt and the model's own text are not included.")
+
+
+def source_summary(calls_by_agent):
+    """Table: tool output characters per source type. calls_by_agent: [[calls of 1 agent], ...]."""
+    agg = defaultdict(lambda: [0, 0, 0, 0])  # agents, calls, chars, largest
+    for calls in calls_by_agent:
+        seen = set()
+        for c in calls:
+            for k, v in (c.get("src") or {}).items():
+                a = agg[k]
+                a[0] += k not in seen
+                seen.add(k)
+                a[1] += 1
+                a[2] += v
+                a[3] = max(a[3], v)
+    if not agg:
+        return "<p class='note'>No source data. Agents recorded before version 0.3.0 have none.</p>"
+    total = sum(a[2] for a in agg.values())
+    multi = len(calls_by_agent) > 1
+    out = [f"<div class='wrap'><table class='sortable'><thead><tr><th>Source</th>"
+           + ("<th class='num'>Agents</th>" if multi else "")
+           + "<th class='num'>Calls</th><th class='num'>Output chars</th><th class='num'>Share of output</th>"
+           "<th class='num'>Largest output</th></tr></thead><tbody>"]
+    for k, (ag, n, ch, big) in sorted(agg.items(), key=lambda kv: -kv[1][2]):
+        label = f"<code>{esc(k)}</code>" if k.startswith(".") else f"<i>{esc(k)}</i>"
+        out.append(f"<tr><td>{label}</td>" + (f"<td class='num' data-v='{ag}'>{ag}</td>" if multi else "")
+                   + f"<td class='num' data-v='{n}'>{fmt_n(n)}</td><td class='num' data-v='{ch}'>{fmt_n(ch)}</td>"
+                   f"{share_cell(ch, total)}<td class='num' data-v='{big}'>{fmt_n(big)}</td></tr>")
+    out.append("</tbody></table></div>")
+    return "".join(out)
+
+
+def src_label(src):
+    """Short text for the call table: the source types of 1 call, largest first."""
+    return ", ".join(k for k, _ in sorted((src or {}).items(), key=lambda kv: -kv[1]))
+
+
+def fmt_dur(s):
+    return f"{s:.1f} s" if s < 60 else f"{s / 60:.1f} min" if s < 3600 else f"{s / 3600:.2f} h"
+
+
+def agent_link(row):
+    """Path of the agent page, relative to a session page, or None if there is no tool data."""
+    if not os.path.exists(agent_file(row.get("agent_id", ""), "json")):
+        return None
+    return os.path.relpath(agent_file(row.get("agent_id", ""), "html"), SESSIONS_DIR)
+
+
+def context_section(context, wall_s):
+    """HTML: context growth numbers and the chart container (the chart is drawn by AGENT_JS)."""
+    if not context:
+        return "<h2>Context over time</h2><p class='note'>No API requests with token data.</p>"
+    sizes = [c["ctx"] for c in context]
+    growth = sizes[-1] - sizes[0]
+    jumps = [(sizes[i] - sizes[i - 1], context[i]["t"]) for i in range(1, len(sizes))]
+    jump, jump_t = max(jumps, default=(0, 0))
+    per_call = growth / (len(sizes) - 1) if len(sizes) > 1 else 0
+    per_min = growth / (wall_s / 60) if wall_s else 0
+    at = datetime.fromtimestamp(jump_t / 1000, timezone.utc).strftime("%H:%M:%S") if jump_t else ""
+    stats = [("Start", fmt_n(sizes[0])), ("Peak", fmt_n(max(sizes))), ("End", fmt_n(sizes[-1])),
+             ("Growth", f"{growth:+,}"), ("Per API call", f"{per_call:+,.0f}"),
+             ("Per active minute", f"{per_min:+,.0f}"), ("Largest jump", f"{jump:+,}" + (f" at {at} UTC" if at else ""))]
+    tiles = "".join(f"<div class='stat'><span>{k}</span><b>{v}</b></div>" for k, v in stats)
+    return ("<h2>Context over time</h2><p class='note'>Each point is 1 API request. The y axis is the "
+            "context size: input + cache read + cache write tokens of that request. The x axis is the time "
+            "since the agent start. Growth = end - start, in tokens.</p>"
+            f"<div class='stats'>{tiles}</div><div id='ctxchart' class='chart'></div>")
+
+
+def render_agent(row, role, session_title_text):
+    data = read_agent_data(row.get("agent_id", ""))
+    if data is None:
+        return
+    calls, context = data["calls"], data["context"]
+    sid = row.get("session_id", "")
+    session_link = os.path.relpath(session_file(sid), AGENTS_DIR)
+    desc = row.get("description") or "(no description)"
+    total = sum(c.get("chars", 0) for c in calls)
+    errs = sum(1 for c in calls if c.get("err"))
+    big = max(calls, key=lambda c: c.get("chars", 0), default=None)
+    largest = f" (call #{big['n']}, {esc(big['tool'])})" if big else ""
+    for c in calls:
+        c["group"] = tool_group(c.get("tool", ""))
+    body = [f"<p class='crumb'><a href='../index.html'>All sessions</a> &rsaquo; "
+            f"<a href='{esc(session_link)}'>{esc(session_title_text)}</a></p>",
+            f"<h1>{esc(desc)}</h1><p class='meta'>Role {esc(role)} &middot; type {esc(row.get('agent_type', ''))} "
+            f"&middot; {esc(short_model(row.get('model', '')))} &middot; {esc(tool_name(row))} &middot; started "
+            f"{esc(row.get('started_at', '').replace('T', ' ')[:16])} UTC &middot; active "
+            f"{fmt_dur(num(row.get('wall_s')))} &middot; agent {esc(row.get('agent_id', ''))}. "
+            f"Generated {generated()} UTC.</p>",
+            f"<p class='meta'><b>{len(calls)}</b> tool calls &middot; <b>{fmt_n(total)}</b> characters of tool "
+            f"output &middot; largest: <b>{fmt_n(big['chars']) if big else 0}</b>{largest} &middot; "
+            f"<b>{errs}</b> error results</p>"]
+    body.append(context_section(context, num(row.get("wall_s"))))
+    if not calls:
+        body.append("<p class='note'>This agent made no tool calls.</p>")
+    else:
+        present = {c["group"] for c in calls}
+        legend = "".join(f"<span><span class='key' style='background:var(--t-{g})'></span>{GROUP_LABELS[g]}</span>"
+                         for g in ["shell", "read", "edit", "other"] if g in present)
+        body.append("<h2>Tool output per call</h2><p class='note'>Each point is 1 tool call, in call order. "
+                    "The y axis is the number of characters in the tool result: the text that went into "
+                    "the context of the agent. The dot color is the tool group. Hover the chart to see the call.</p>"
+                    f"<div class='controls'><div class='legend'>{legend}</div></div>"
+                    "<div id='toolchart' class='chart'></div>")
+        body.append("<h2>Tool output by source</h2><p class='note'>" + SOURCE_NOTE + "</p>"
+                    + source_summary([calls]))
+        body.append("<h2>Tools</h2><p class='meta'>Tool time is the sum of the times from a call to its "
+                    "result. Click a column header to sort.</p>"
+                    + tool_summary(calls, "Tool", lambda c: c.get("tool", "?"), tool_key))
+        shell = [c for c in calls if c["group"] == "shell"]
+        if shell:
+            body.append("<h2>Shell programs</h2><p class='meta'>The first program of each shell command. "
+                        "<code>cd</code>, <code>export</code> and variable assignments are skipped.</p>"
+                        + tool_summary(shell, "Program", lambda c: c.get("prog") or "?", esc))
+        trs = []
+        for c in calls:
+            t = datetime.fromtimestamp(c["t"] / 1000, timezone.utc).strftime("%H:%M:%S") if c.get("t") else ""
+            dur = c.get("dur_s")
+            name = esc(c.get("tool", "")) + (f" &middot; {esc(c['prog'])}" if c.get("prog") else "")
+            trs.append(f"<tr><td class='num' data-v='{c['n']}'>{c['n']}</td><td>{t}</td>"
+                       f"<td><span class='key' style='background:var(--t-{c['group']})'></span>{name}</td>"
+                       f"<td class='in'>{esc(c.get('in', ''))}</td><td>{esc(src_label(c.get('src')))}</td>"
+                       f"<td class='num' data-v='{c.get('chars', 0)}'>{fmt_n(c.get('chars', 0))}</td>"
+                       f"<td class='num' data-v='{dur if dur is not None else -1}'>{fmt_dur(dur) if dur is not None else ''}</td>"
+                       f"<td>{'<span class=err>error</span>' if c.get('err') else ''}</td></tr>")
+        body.append("<h2>Calls</h2><div class='wrap'><table class='sortable'><thead><tr><th class='num'>#</th>"
+                    "<th>Time (UTC)</th><th>Tool</th><th>Input</th><th>Source</th><th class='num'>Output chars</th>"
+                    f"<th class='num'>Time</th><th>Result</th></tr></thead><tbody>{''.join(trs)}</tbody></table></div>")
+    start = int(ts(row["started_at"]).timestamp() * 1000) if row.get("started_at") else 0
+    page_data = {"calls": calls, "context": context, "start": start,
+                 "family": family(short_model(row.get("model", "")))}
+    page_json = json.dumps(page_data).replace("</", "<\\/")
+    body.append(f"<script id='agent-data' type='application/json'>{page_json}</script>")
+    write_page(agent_file(row.get("agent_id", ""), "html"), f"{desc[:60]} tools", "".join(body), AGENT_JS)
 
 
 def tool_name(row):
